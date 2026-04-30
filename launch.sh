@@ -335,6 +335,18 @@ install_claude_md() {
   rm -f "$tmp"
 }
 
+# Ensure CLAUDE.md is excluded from git tracking in the repo that contains $dir.
+# Uses .git/info/exclude (local, never committed) so it applies to all worktrees
+# without modifying .gitignore.
+exclude_claude_md_from_git() {
+  local dir="$1"
+  local git_common_dir
+  git_common_dir=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return
+  mkdir -p "$git_common_dir/info"
+  grep -qxF 'CLAUDE.md' "$git_common_dir/info/exclude" 2>/dev/null \
+    || echo 'CLAUDE.md' >> "$git_common_dir/info/exclude"
+}
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 load_config() {
   local cfg="$1" val
@@ -423,6 +435,25 @@ if [[ "$END_SESSION" == true ]]; then
     exit 0
   fi
 
+  # ── Helpers (bash 3.2 compat — no associative arrays) ────────────────────────
+  _branches_to_keep=()
+  _worktrees_to_keep=()
+  _merge_ops=()
+
+  _mark_keep()    { _branches_to_keep+=("$1"); }
+  _mark_wt_keep() { _worktrees_to_keep+=("$1"); }
+  _is_kept() {
+    local _e="$1" _k
+    for _k in "${_branches_to_keep[@]:-}"; do [[ "$_k" == "$_e" ]] && return 0; done
+    return 1
+  }
+  _wt_is_kept() {
+    local _e="$1" _k
+    for _k in "${_worktrees_to_keep[@]:-}"; do [[ "$_k" == "$_e" ]] && return 0; done
+    return 1
+  }
+
+  # ── Kill tmux sessions first so agents stop before we touch git ───────────────
   for _sess in "${_sessions[@]}"; do
     if tmux kill-session -t "$_sess" 2>/dev/null; then
       gum style --foreground 40 "✓ Killed tmux session $_sess" >&2
@@ -431,8 +462,140 @@ if [[ "$END_SESSION" == true ]]; then
     fi
   done
 
+  # ── Uncommitted changes check ─────────────────────────────────────────────────
+  for _entry in "${_worktrees[@]}"; do
+    IFS='|' read -r _uc_repo _uc_wt <<< "$_entry"
+    [[ ! -d "$_uc_wt" ]] && continue
+
+    _uc_status=$(git -C "$_uc_wt" status --porcelain 2>/dev/null)
+    [[ -z "$_uc_status" ]] && continue
+
+    _uc_branch=$(git -C "$_uc_wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    gum style \
+      --border rounded --border-foreground 196 \
+      --padding "0 1" --margin "1 0" \
+      "Uncommitted changes: $_uc_branch" \
+      "" \
+      "$_uc_status" >&2
+
+    _uc_action=$(gum choose \
+      "Commit all changes" \
+      "Discard changes" \
+      "Keep worktree — skip cleanup" \
+      --header "Uncommitted changes in $_uc_branch")
+
+    case "$_uc_action" in
+      "Commit all changes")
+        _uc_msg=$(gum input --placeholder "feat: ..." --prompt "Commit message ❯ ")
+        if [[ -n "$_uc_msg" ]]; then
+          git -C "$_uc_wt" add -A >/dev/null
+          git -C "$_uc_wt" commit -m "$_uc_msg" >/dev/null
+          gum style --foreground 40 "✓ Committed to $_uc_branch" >&2
+        else
+          gum style --faint "  Empty message — keeping worktree" >&2
+          _mark_wt_keep "$_entry"
+          _mark_keep "$_uc_repo|$_uc_branch"
+        fi
+        ;;
+      "Discard changes")
+        git -C "$_uc_wt" reset --hard HEAD >/dev/null 2>&1
+        git -C "$_uc_wt" clean -fd >/dev/null 2>&1
+        gum style --foreground 40 "✓ Discarded changes in $_uc_branch" >&2
+        ;;
+      "Keep worktree — skip cleanup")
+        _mark_wt_keep "$_entry"
+        _mark_keep "$_uc_repo|$_uc_branch"
+        gum style --foreground 220 "  Keeping $_uc_wt" >&2
+        ;;
+    esac
+  done
+
+  # ── Merge picker ─────────────────────────────────────────────────────────────
+  for _entry in "${_branches[@]}"; do
+    IFS='|' read -r _mp_repo _mp_branch <<< "$_entry"
+    _mp_repo_name=$(basename "$_mp_repo")
+
+    _is_kept "$_entry" && continue  # user opted out of cleanup for this branch
+
+    _mp_ahead=$(git -C "$_mp_repo" log --oneline "$_mp_branch" --not HEAD 2>/dev/null \
+      | wc -l | tr -d ' ')
+
+    if [[ "$_mp_ahead" -eq 0 ]]; then
+      gum style --faint "  $_mp_branch — no new commits" >&2
+      continue
+    fi
+
+    _mp_preview=$(git -C "$_mp_repo" log --oneline --decorate -8 "$_mp_branch" \
+      --not HEAD 2>/dev/null)
+
+    gum style \
+      --border rounded --border-foreground 220 \
+      --padding "0 1" --margin "1 0" \
+      "Branch: $_mp_branch  ($_mp_repo_name)" \
+      "" \
+      "$_mp_ahead commit(s) not in HEAD:" \
+      "$_mp_preview" >&2
+
+    _mp_action=$(gum choose \
+      "Merge into a branch" \
+      "Keep branch (remove worktree only)" \
+      "Delete without merging" \
+      --header "What to do with $_mp_branch?")
+
+    case "$_mp_action" in
+      "Merge into a branch")
+        _mp_target=$(git -C "$_mp_repo" branch --format='%(refname:short)' \
+          | grep -v "^$_mp_branch$" \
+          | gum filter \
+              --header "Merge $_mp_branch into:" \
+              --placeholder "Type to filter…" \
+              --height 15)
+        if [[ -n "$_mp_target" ]]; then
+          _merge_ops+=("$_mp_repo|$_mp_branch|$_mp_target")
+        else
+          gum style --faint "  No target selected — keeping branch." >&2
+          _mark_keep "$_entry"
+        fi
+        ;;
+      "Keep branch (remove worktree only)")
+        _mark_keep "$_entry"
+        ;;
+      "Delete without merging") ;;  # default: delete
+    esac
+  done
+
+  # ── Execute merges ───────────────────────────────────────────────────────────
+  for _op in ${_merge_ops[@]+"${_merge_ops[@]}"}; do
+    IFS='|' read -r _mg_repo _mg_src _mg_tgt <<< "$_op"
+    _mg_saved=$(git -C "$_mg_repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    if ! git -C "$_mg_repo" checkout "$_mg_tgt" >/dev/null 2>&1; then
+      gum style --foreground 196 "✗ Could not checkout $_mg_tgt in $(basename "$_mg_repo")" >&2
+      continue
+    fi
+
+    if git -C "$_mg_repo" merge --no-ff "$_mg_src" 2>/dev/null; then
+      gum style --foreground 40 "✓ Merged $_mg_src → $_mg_tgt" >&2
+    else
+      gum style --foreground 196 \
+        "✗ Merge conflict: $_mg_src → $_mg_tgt  — resolve manually, branch kept" >&2
+      git -C "$_mg_repo" merge --abort 2>/dev/null || true
+      _mark_keep "$_mg_repo|$_mg_src"
+    fi
+
+    # Restore original HEAD
+    if [[ -n "$_mg_saved" && "$_mg_saved" != "HEAD" ]]; then
+      git -C "$_mg_repo" checkout "$_mg_saved" >/dev/null 2>&1 || true
+    fi
+  done
+
   for _entry in "${_worktrees[@]}"; do
     IFS='|' read -r _repo _wt <<< "$_entry"
+    if _wt_is_kept "$_entry"; then
+      gum style --foreground 220 "  Kept worktree $_wt" >&2
+      continue
+    fi
     if git -C "$_repo" worktree remove "$_wt" 2>/dev/null; then
       gum style --foreground 40 "✓ Removed worktree $_wt" >&2
     else
@@ -442,6 +605,10 @@ if [[ "$END_SESSION" == true ]]; then
 
   for _entry in "${_branches[@]}"; do
     IFS='|' read -r _repo _branch <<< "$_entry"
+    if _is_kept "$_entry"; then
+      gum style --foreground 220 "  Kept branch $_branch" >&2
+      continue
+    fi
     if git -C "$_repo" branch -d "$_branch" 2>/dev/null; then
       gum style --foreground 40 "✓ Deleted branch $_branch" >&2
     else
@@ -621,6 +788,9 @@ for feature in "${FEATURES[@]}"; do
   WT_A=$(create_worktree "$DIR_A" "$BRANCH_A")
   WT_B=""
   [[ -n "$DIR_B" ]] && WT_B=$(create_worktree "$DIR_B" "$BRANCH_B")
+
+  exclude_claude_md_from_git "$WT_A"
+  [[ -n "$WT_B" ]] && exclude_claude_md_from_git "$WT_B"
 
   rm -rf "$BRIDGE"
   mkdir -p "$BRIDGE"
