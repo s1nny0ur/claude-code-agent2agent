@@ -139,7 +139,7 @@ claude-dev \
 | `--role-b` | `secondary` | Label shown in agent headers and `CLAUDE.md` |
 | `--session` | `claude-dev` | Base name for tmux sessions and worktree branches |
 | `--base-dir` | `~/sites` | Where to clone repos and where the local picker looks |
-| `--preset` | — | `sanity-nextjs` — two worktrees from one repo with role-specific templates |
+| `--preset` | — | `sanity-nextjs` or `payload-nextjs` — two worktrees from one repo with role-specific templates |
 | `--pick-terminal` | — | Force the terminal picker even if `~/.claude-dev-global` already has one saved |
 | `--end` | — | Interactively tear down the session for the current repo |
 | `-h, --help` | — | Show usage and examples |
@@ -290,6 +290,82 @@ npm run dev
 
 ---
 
+## Payload/Next.js co-located repo
+
+For projects where Payload CMS is embedded in a Next.js app (`src/payload.config.ts` + `next.config.ts`, single dev server), use the `payload-nextjs` preset:
+
+```bash
+# From inside the repo, or pointing at it:
+claude-dev --repo-a ./my-app --preset payload-nextjs
+
+# Features work the same way:
+claude-dev --repo-a ./my-app --preset payload-nextjs --features "homepage,blog"
+```
+
+If you run `claude-dev` interactively and the selected repo has both `payload.config.ts` (at root or in `src/`) and `next.config.ts`, the preset is offered automatically.
+
+### What the preset does
+
+- Creates **two worktrees from the same repo**: one for the Payload agent (`-payload` branch), one for the Next.js agent (`-nextjs` branch)
+- Installs role-specific `CLAUDE.md` templates (`CLAUDE-agent-payload.md` / `CLAUDE-agent-nextjs-payload.md`) instead of the generic A/B ones
+- Defaults roles to `payload` and `nextjs`
+- Adds coordination files to the bridge (see below)
+
+### Agent ownership
+
+| Agent | Owns | Reads but doesn't edit |
+|---|---|---|
+| **Payload** | `src/payload.config.ts`, `src/collections/`, `src/blocks/*/config.ts`, `src/fields/`, `src/plugins/`, `src/hooks/` | `src/app/(frontend)/`, `src/components/`, `src/blocks/*/Component.tsx` |
+| **Next.js** | `src/app/(frontend)/`, `src/components/`, `src/heros/`, `src/blocks/*/Component.tsx`, `src/blocks/RenderBlocks.tsx` | `src/collections/`, `src/payload-types.ts` |
+
+### Extra bridge files (preset only)
+
+```
+typegen-status          idle | running | done — Next.js agent waits for "done" before using new types
+typegen-log.md          output of the last `pnpm payload generate:types` run
+schema-contract.md      Payload agent documents collection field shapes and REST endpoints; Next.js reads before writing fetch code
+block-registry-queue.md  append-only queue of new block types pending Component.tsx creation
+preset                  "payload-nextjs" — used internally by the bridge
+```
+
+### Block addition workflow
+
+When a new Payload block is needed (e.g. Hero), the work spans both agents:
+
+**Payload agent:**
+1. Create `src/blocks/Hero/config.ts`
+2. Register block in `payload.config.ts`
+3. Run `pnpm payload generate:types` → write status to bridge
+4. Document field shape in `schema-contract.md`
+5. Append `hero|HeroBlock` to `block-registry-queue.md`
+6. Notify Next.js agent via bridge
+
+**Next.js agent (on notification):**
+1. Wait for `typegen-status = done`
+2. Read `schema-contract.md` + grep `payload-types.ts` for the type
+3. Create `src/blocks/Hero/Component.tsx`
+4. Register in `src/blocks/RenderBlocks.tsx`
+5. Confirm back via bridge
+
+### Dev server
+
+Payload admin runs inside Next.js — no separate process:
+
+```bash
+pnpm dev
+# Next.js:  http://localhost:3000
+# Admin:    http://localhost:3000/admin
+```
+
+### Branch naming
+
+```
+{session}-{feature}-payload    e.g. claude-dev-main-payload
+{session}-{feature}-nextjs     e.g. claude-dev-main-nextjs
+```
+
+---
+
 ## Session layout
 
 For `--features "auth,payments"` with two repos, the launcher opens **two** terminal windows — one per feature, each split into two panes:
@@ -399,18 +475,21 @@ agent2agent-dev/
   send-to-agent.sh           Bridge messaging script (copied into each bridge dir at launch)
   CLAUDE-agent-a.md          Agent A instructions template (generic)
   CLAUDE-agent-b.md          Agent B instructions template (generic)
-  CLAUDE-agent-sanity.md     Sanity agent template (--preset sanity-nextjs)
-  CLAUDE-agent-nextjs.md     Next.js agent template (--preset sanity-nextjs)
-  README.md                  This file
+  CLAUDE-agent-sanity.md          Sanity agent template (--preset sanity-nextjs)
+  CLAUDE-agent-nextjs.md          Next.js agent template (--preset sanity-nextjs)
+  CLAUDE-agent-payload.md         Payload agent template (--preset payload-nextjs)
+  CLAUDE-agent-nextjs-payload.md  Next.js agent template (--preset payload-nextjs)
+  README.md                       This file
 ```
 
 ---
 
 ## Customising agent templates
 
-`CLAUDE-agent-a.md`, `CLAUDE-agent-b.md`, `CLAUDE-agent-sanity.md`, and `CLAUDE-agent-nextjs.md` are plain markdown files. Edit them to bake in team conventions, coding standards, or response formats. Every session inherits whatever is in these files.
+`CLAUDE-agent-a.md`, `CLAUDE-agent-b.md`, `CLAUDE-agent-sanity.md`, `CLAUDE-agent-nextjs.md`, `CLAUDE-agent-payload.md`, and `CLAUDE-agent-nextjs-payload.md` are plain markdown files. Edit them to bake in team conventions, coding standards, or response formats. Every session inherits whatever is in these files.
 
 The `--preset sanity-nextjs` flag uses the `sanity`/`nextjs` templates instead of the generic `a`/`b` ones.
+The `--preset payload-nextjs` flag uses the `payload`/`nextjs-payload` templates instead of the generic `a`/`b` ones.
 
 Available placeholders:
 

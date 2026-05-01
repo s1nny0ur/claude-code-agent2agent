@@ -38,7 +38,7 @@ show_help() {
   printf '  --role-b LABEL              Agent B label (default: secondary)\n'
   printf '  --session NAME              tmux session base name (default: claude-dev)\n'
   printf '  --base-dir PATH             Where to clone repos (default: ~/sites)\n'
-  printf '  --preset NAME               Preset: sanity-nextjs (Sanity+Next.js co-located repo)\n'
+  printf '  --preset NAME               Preset: sanity-nextjs | payload-nextjs (co-located repo)\n'
   printf '  --pick-terminal             Re-run the terminal picker\n'
   printf '  --end                       Kill tmux session, remove worktrees & branches\n'
   printf '  -h, --help                  Show this help\n'
@@ -48,6 +48,7 @@ show_help() {
   printf '  claude-dev --pick-terminal\n'
   printf '  cd ~/sites/my-app && claude-dev --end\n'
   printf '  claude-dev --repo-a ./my-app --preset sanity-nextjs\n'
+  printf '  claude-dev --repo-a ./my-app --preset payload-nextjs\n'
   printf '\n'
   printf 'Terminal preference is saved to ~/.claude-dev-global after first run.\n'
   printf 'Session config is saved to .claude-dev in each repo after first launch.\n'
@@ -396,6 +397,9 @@ if [[ "$END_SESSION" == true ]]; then
     if [[ "$PRESET" == "sanity-nextjs" ]]; then
       _branch_a="${SESSION_NAME}-${_f}-sanity"
       _branch_b="${SESSION_NAME}-${_f}-nextjs"
+    elif [[ "$PRESET" == "payload-nextjs" ]]; then
+      _branch_a="${SESSION_NAME}-${_f}-payload"
+      _branch_b="${SESSION_NAME}-${_f}-nextjs"
     else
       _branch_a="${SESSION_NAME}-${_f}-a"
       _branch_b="${SESSION_NAME}-${_f}-b"
@@ -703,14 +707,21 @@ fi
 # ── Preset auto-detection ─────────────────────────────────────────────────────
 if [[ -z "$PRESET" ]]; then
   _check_dir="${REPO_A/#\~/$HOME}"
-  if [[ -d "$_check_dir" && -f "$_check_dir/sanity.config.ts" && -f "$_check_dir/next.config.ts" ]]; then
-    if gum confirm --default=true "Sanity+Next.js project detected. Use sanity-nextjs preset?"; then
-      PRESET="sanity-nextjs"
+  if [[ -d "$_check_dir" ]]; then
+    if [[ -f "$_check_dir/sanity.config.ts" && -f "$_check_dir/next.config.ts" ]]; then
+      if gum confirm --default=true "Sanity+Next.js project detected. Use sanity-nextjs preset?"; then
+        PRESET="sanity-nextjs"
+      fi
+    elif [[ -f "$_check_dir/next.config.ts" ]] && \
+         [[ -f "$_check_dir/payload.config.ts" || -f "$_check_dir/src/payload.config.ts" ]]; then
+      if gum confirm --default=true "Payload+Next.js project detected. Use payload-nextjs preset?"; then
+        PRESET="payload-nextjs"
+      fi
     fi
   fi
 fi
 
-if [[ -z "$REPO_B" && "$PRESET" != "sanity-nextjs" ]]; then
+if [[ -z "$REPO_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]]; then
   _src=$(gum choose \
     "Pick from $BASE_DIR" \
     "Clone from GitHub" \
@@ -750,6 +761,12 @@ if [[ "$PRESET" == "sanity-nextjs" ]]; then
   REPO_B="$REPO_A"
 fi
 
+if [[ "$PRESET" == "payload-nextjs" ]]; then
+  [[ "$ROLE_A" == "primary" ]]   && ROLE_A="payload"
+  [[ "$ROLE_B" == "secondary" ]] && ROLE_B="nextjs"
+  REPO_B="$REPO_A"
+fi
+
 # ── Resolve repos to local paths ──────────────────────────────────────────────
 DIR_A=$(resolve_repo "$REPO_A" "$ROLE_A")
 DIR_B=""
@@ -761,8 +778,9 @@ save_repo_config "$DIR_A"
 
 # ── Print session config ──────────────────────────────────────────────────────
 _summary="Session:   $SESSION_NAME"$'\n'"Repo A:    $DIR_A  ($ROLE_A)"
-[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" ]] && _summary+=$'\n'"Repo B:    $DIR_B  ($ROLE_B)"
+[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]] && _summary+=$'\n'"Repo B:    $DIR_B  ($ROLE_B)"
 [[ "$PRESET" == "sanity-nextjs" ]] && _summary+=$'\n'"Preset:    sanity-nextjs"
+[[ "$PRESET" == "payload-nextjs" ]] && _summary+=$'\n'"Preset:    payload-nextjs"
 _summary+=$'\n'"Features:  ${FEATURES[*]}"
 gum style \
   --border rounded --border-foreground 51 \
@@ -776,9 +794,9 @@ for feature in "${FEATURES[@]}"; do
   BRIDGE="$BRIDGE_BASE-${SESSION_NAME}-${feature}"
   SESSION_A="${SESSION_NAME}-${feature}-a"
   SESSION_B="${SESSION_NAME}-${feature}-b"
-  if [[ "$PRESET" == "sanity-nextjs" ]]; then
-    BRANCH_A="${SESSION_NAME}-${feature}-sanity"
-    BRANCH_B="${SESSION_NAME}-${feature}-nextjs"
+  if [[ "$PRESET" == "sanity-nextjs" || "$PRESET" == "payload-nextjs" ]]; then
+    BRANCH_A="${SESSION_NAME}-${feature}-${ROLE_A}"
+    BRANCH_B="${SESSION_NAME}-${feature}-${ROLE_B}"
   else
     BRANCH_A="${SESSION_NAME}-${feature}-a"
     BRANCH_B="${SESSION_NAME}-${feature}-b"
@@ -815,6 +833,14 @@ for feature in "${FEATURES[@]}"; do
     echo "sanity-nextjs"  > "$BRIDGE/preset"
   fi
 
+  if [[ "$PRESET" == "payload-nextjs" ]]; then
+    echo "idle"            > "$BRIDGE/typegen-status"
+    printf ""              > "$BRIDGE/typegen-log.md"
+    printf ""              > "$BRIDGE/schema-contract.md"
+    printf ""              > "$BRIDGE/block-registry-queue.md"
+    echo "payload-nextjs"  > "$BRIDGE/preset"
+  fi
+
   tmux kill-session -t "$SESSION_A" 2>/dev/null || true
 
   cp "$SCRIPT_DIR/send-to-agent.sh" "$BRIDGE/send-to-agent.sh"
@@ -823,6 +849,9 @@ for feature in "${FEATURES[@]}"; do
   if [[ "$PRESET" == "sanity-nextjs" ]]; then
     _tmpl_a="CLAUDE-agent-sanity.md"
     _tmpl_b="CLAUDE-agent-nextjs.md"
+  elif [[ "$PRESET" == "payload-nextjs" ]]; then
+    _tmpl_a="CLAUDE-agent-payload.md"
+    _tmpl_b="CLAUDE-agent-nextjs-payload.md"
   else
     _tmpl_a="CLAUDE-agent-a.md"
     _tmpl_b="CLAUDE-agent-b.md"
@@ -850,8 +879,9 @@ done
 feat_count=${#FEATURES[@]}
 _ready="Claude Dev — $feat_count feature(s) launched: ${FEATURES[*]}"$'\n'
 _ready+=$'\n'"  Repo A:  $DIR_A"
-[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" ]] && _ready+=$'\n'"  Repo B:  $DIR_B"
+[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]] && _ready+=$'\n'"  Repo B:  $DIR_B"
 [[ "$PRESET" == "sanity-nextjs" ]] && _ready+=$'\n'"  Preset:  sanity-nextjs  (Studio at localhost:3000/studio)"
+[[ "$PRESET" == "payload-nextjs" ]] && _ready+=$'\n'"  Preset:  payload-nextjs  (Admin at localhost:3000/admin)"
 _ready+=$'\n'
 _ready+=$'\n'"  Each agent has its own worktree + $TERMINAL_APP window."
 _ready+=$'\n'"  Re-attach:  tmux attach -t ${SESSION_NAME}-<feature>-a"
