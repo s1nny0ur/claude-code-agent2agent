@@ -38,7 +38,7 @@ show_help() {
   printf '  --role-b LABEL              Agent B label (default: secondary)\n'
   printf '  --session NAME              tmux session base name (default: claude-dev)\n'
   printf '  --base-dir PATH             Where to clone repos (default: ~/sites)\n'
-  printf '  --preset NAME               Preset: sanity-nextjs | payload-nextjs (co-located repo)\n'
+  printf '  --preset NAME               Preset: sanity-nextjs | payload-nextjs | statamic (co-located repo)\n'
   printf '  --pick-terminal             Re-run the terminal picker\n'
   printf '  --end                       Kill tmux session, remove worktrees & branches\n'
   printf '  -h, --help                  Show this help\n'
@@ -49,6 +49,7 @@ show_help() {
   printf '  cd ~/sites/my-app && claude-dev --end\n'
   printf '  claude-dev --repo-a ./my-app --preset sanity-nextjs\n'
   printf '  claude-dev --repo-a ./my-app --preset payload-nextjs\n'
+  printf '  claude-dev --repo-a ./my-app --preset statamic\n'
   printf '\n'
   printf 'Terminal preference is saved to ~/.claude-dev-global after first run.\n'
   printf 'Session config is saved to .claude-dev in each repo after first launch.\n'
@@ -338,7 +339,8 @@ install_claude_md() {
 
 # Ensure CLAUDE.md is excluded from git tracking in the repo that contains $dir.
 # Uses .git/info/exclude (local, never committed) so it applies to all worktrees
-# without modifying .gitignore.
+# without modifying .gitignore. If CLAUDE.md is already tracked in HEAD,
+# mark it skip-worktree so `git add -A` won't stage local edits.
 exclude_claude_md_from_git() {
   local dir="$1"
   local git_common_dir
@@ -346,6 +348,10 @@ exclude_claude_md_from_git() {
   mkdir -p "$git_common_dir/info"
   grep -qxF 'CLAUDE.md' "$git_common_dir/info/exclude" 2>/dev/null \
     || echo 'CLAUDE.md' >> "$git_common_dir/info/exclude"
+
+  if git -C "$dir" ls-files --error-unmatch CLAUDE.md &>/dev/null; then
+    git -C "$dir" update-index --skip-worktree CLAUDE.md 2>/dev/null || true
+  fi
 }
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -400,6 +406,9 @@ if [[ "$END_SESSION" == true ]]; then
     elif [[ "$PRESET" == "payload-nextjs" ]]; then
       _branch_a="${SESSION_NAME}-${_f}-payload"
       _branch_b="${SESSION_NAME}-${_f}-nextjs"
+    elif [[ "$PRESET" == "statamic" ]]; then
+      _branch_a="${SESSION_NAME}-${_f}-statamic"
+      _branch_b="${SESSION_NAME}-${_f}-frontend"
     else
       _branch_a="${SESSION_NAME}-${_f}-a"
       _branch_b="${SESSION_NAME}-${_f}-b"
@@ -582,10 +591,25 @@ if [[ "$END_SESSION" == true ]]; then
     if git -C "$_mg_repo" merge --no-ff "$_mg_src" 2>/dev/null; then
       gum style --foreground 40 "✓ Merged $_mg_src → $_mg_tgt" >&2
     else
-      gum style --foreground 196 \
-        "✗ Merge conflict: $_mg_src → $_mg_tgt  — resolve manually, branch kept" >&2
-      git -C "$_mg_repo" merge --abort 2>/dev/null || true
-      _mark_keep "$_mg_repo|$_mg_src"
+      _mg_conflicts=$(git -C "$_mg_repo" diff --name-only --diff-filter=U 2>/dev/null)
+      if [[ "$_mg_conflicts" == "CLAUDE.md" ]]; then
+        git -C "$_mg_repo" checkout HEAD -- CLAUDE.md >/dev/null 2>&1
+        git -C "$_mg_repo" add CLAUDE.md >/dev/null 2>&1
+        if git -C "$_mg_repo" -c core.editor=true commit --no-edit >/dev/null 2>&1; then
+          gum style --foreground 40 \
+            "✓ Merged $_mg_src → $_mg_tgt  (auto-resolved CLAUDE.md to target)" >&2
+        else
+          gum style --foreground 196 \
+            "✗ Merge conflict: $_mg_src → $_mg_tgt  — resolve manually, branch kept" >&2
+          git -C "$_mg_repo" merge --abort 2>/dev/null || true
+          _mark_keep "$_mg_repo|$_mg_src"
+        fi
+      else
+        gum style --foreground 196 \
+          "✗ Merge conflict: $_mg_src → $_mg_tgt  — resolve manually, branch kept" >&2
+        git -C "$_mg_repo" merge --abort 2>/dev/null || true
+        _mark_keep "$_mg_repo|$_mg_src"
+      fi
     fi
 
     # Restore original HEAD
@@ -717,11 +741,16 @@ if [[ -z "$PRESET" ]]; then
       if gum confirm --default=true "Payload+Next.js project detected. Use payload-nextjs preset?"; then
         PRESET="payload-nextjs"
       fi
+    elif [[ -f "$_check_dir/composer.json" ]] && \
+         grep -q '"statamic/cms"' "$_check_dir/composer.json" 2>/dev/null; then
+      if gum confirm --default=true "Statamic project detected. Use statamic preset?"; then
+        PRESET="statamic"
+      fi
     fi
   fi
 fi
 
-if [[ -z "$REPO_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]]; then
+if [[ -z "$REPO_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" && "$PRESET" != "statamic" ]]; then
   _src=$(gum choose \
     "Pick from $BASE_DIR" \
     "Clone from GitHub" \
@@ -767,6 +796,12 @@ if [[ "$PRESET" == "payload-nextjs" ]]; then
   REPO_B="$REPO_A"
 fi
 
+if [[ "$PRESET" == "statamic" ]]; then
+  [[ "$ROLE_A" == "primary" ]]   && ROLE_A="statamic"
+  [[ "$ROLE_B" == "secondary" ]] && ROLE_B="frontend"
+  REPO_B="$REPO_A"
+fi
+
 # ── Resolve repos to local paths ──────────────────────────────────────────────
 DIR_A=$(resolve_repo "$REPO_A" "$ROLE_A")
 DIR_B=""
@@ -778,9 +813,10 @@ save_repo_config "$DIR_A"
 
 # ── Print session config ──────────────────────────────────────────────────────
 _summary="Session:   $SESSION_NAME"$'\n'"Repo A:    $DIR_A  ($ROLE_A)"
-[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]] && _summary+=$'\n'"Repo B:    $DIR_B  ($ROLE_B)"
+[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" && "$PRESET" != "statamic" ]] && _summary+=$'\n'"Repo B:    $DIR_B  ($ROLE_B)"
 [[ "$PRESET" == "sanity-nextjs" ]] && _summary+=$'\n'"Preset:    sanity-nextjs"
 [[ "$PRESET" == "payload-nextjs" ]] && _summary+=$'\n'"Preset:    payload-nextjs"
+[[ "$PRESET" == "statamic" ]] && _summary+=$'\n'"Preset:    statamic"
 _summary+=$'\n'"Features:  ${FEATURES[*]}"
 gum style \
   --border rounded --border-foreground 51 \
@@ -794,7 +830,7 @@ for feature in "${FEATURES[@]}"; do
   BRIDGE="$BRIDGE_BASE-${SESSION_NAME}-${feature}"
   SESSION_A="${SESSION_NAME}-${feature}-a"
   SESSION_B="${SESSION_NAME}-${feature}-b"
-  if [[ "$PRESET" == "sanity-nextjs" || "$PRESET" == "payload-nextjs" ]]; then
+  if [[ "$PRESET" == "sanity-nextjs" || "$PRESET" == "payload-nextjs" || "$PRESET" == "statamic" ]]; then
     BRANCH_A="${SESSION_NAME}-${feature}-${ROLE_A}"
     BRANCH_B="${SESSION_NAME}-${feature}-${ROLE_B}"
   else
@@ -822,8 +858,19 @@ for feature in "${FEATURES[@]}"; do
   echo "$ROLE_A" > "$BRIDGE/role-a"
   echo "${ROLE_B:-}" > "$BRIDGE/role-b"
   # Both agents share one tmux session; target panes explicitly for send-to-agent.
-  echo "$SESSION_A:0.0" > "$BRIDGE/session-a"
-  [[ -n "$WT_B" ]] && echo "$SESSION_A:0.1" > "$BRIDGE/session-b"
+  # Honour user's tmux base-index / pane-base-index (commonly set to 1).
+  # tmux options require a running server — spawn a throwaway session if needed.
+  _tmux_probe_started=false
+  if ! tmux ls &>/dev/null; then
+    tmux new-session -d -s _claude_probe 2>/dev/null && _tmux_probe_started=true
+  fi
+  TMUX_BASE_IDX=$(tmux show-options -gv base-index 2>/dev/null)
+  TMUX_PANE_BASE=$(tmux show-options -wgv pane-base-index 2>/dev/null)
+  [[ "$_tmux_probe_started" == true ]] && tmux kill-session -t _claude_probe 2>/dev/null
+  TMUX_BASE_IDX="${TMUX_BASE_IDX:-0}"
+  TMUX_PANE_BASE="${TMUX_PANE_BASE:-0}"
+  echo "$SESSION_A:${TMUX_BASE_IDX}.${TMUX_PANE_BASE}" > "$BRIDGE/session-a"
+  [[ -n "$WT_B" ]] && echo "$SESSION_A:${TMUX_BASE_IDX}.$((TMUX_PANE_BASE + 1))" > "$BRIDGE/session-b"
 
   if [[ "$PRESET" == "sanity-nextjs" ]]; then
     echo "idle"           > "$BRIDGE/typegen-status"
@@ -841,6 +888,14 @@ for feature in "${FEATURES[@]}"; do
     echo "payload-nextjs"  > "$BRIDGE/preset"
   fi
 
+  if [[ "$PRESET" == "statamic" ]]; then
+    echo "idle"      > "$BRIDGE/blueprint-status"
+    echo "clean"     > "$BRIDGE/stache-status"
+    printf ""        > "$BRIDGE/blueprint-contract.md"
+    printf ""        > "$BRIDGE/module-registry-queue.md"
+    echo "statamic"  > "$BRIDGE/preset"
+  fi
+
   tmux kill-session -t "$SESSION_A" 2>/dev/null || true
 
   cp "$SCRIPT_DIR/send-to-agent.sh" "$BRIDGE/send-to-agent.sh"
@@ -852,6 +907,9 @@ for feature in "${FEATURES[@]}"; do
   elif [[ "$PRESET" == "payload-nextjs" ]]; then
     _tmpl_a="CLAUDE-agent-payload.md"
     _tmpl_b="CLAUDE-agent-nextjs-payload.md"
+  elif [[ "$PRESET" == "statamic" ]]; then
+    _tmpl_a="CLAUDE-agent-statamic.md"
+    _tmpl_b="CLAUDE-agent-frontend-statamic.md"
   else
     _tmpl_a="CLAUDE-agent-a.md"
     _tmpl_b="CLAUDE-agent-b.md"
@@ -879,9 +937,10 @@ done
 feat_count=${#FEATURES[@]}
 _ready="Claude Dev — $feat_count feature(s) launched: ${FEATURES[*]}"$'\n'
 _ready+=$'\n'"  Repo A:  $DIR_A"
-[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" ]] && _ready+=$'\n'"  Repo B:  $DIR_B"
+[[ -n "$DIR_B" && "$PRESET" != "sanity-nextjs" && "$PRESET" != "payload-nextjs" && "$PRESET" != "statamic" ]] && _ready+=$'\n'"  Repo B:  $DIR_B"
 [[ "$PRESET" == "sanity-nextjs" ]] && _ready+=$'\n'"  Preset:  sanity-nextjs  (Studio at localhost:3000/studio)"
 [[ "$PRESET" == "payload-nextjs" ]] && _ready+=$'\n'"  Preset:  payload-nextjs  (Admin at localhost:3000/admin)"
+[[ "$PRESET" == "statamic" ]] && _ready+=$'\n'"  Preset:  statamic  (Control Panel at localhost:3000/cp)"
 _ready+=$'\n'
 _ready+=$'\n'"  Each agent has its own worktree + $TERMINAL_APP window."
 _ready+=$'\n'"  Re-attach:  tmux attach -t ${SESSION_NAME}-<feature>-a"

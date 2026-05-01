@@ -117,6 +117,23 @@ claude-dev --end
 
 Shows a summary of everything that will be removed — tmux session, worktrees, branches, bridge dirs, and `.claude-dev` config files — then asks for confirmation before acting. Safe to run even if parts of the session are already gone.
 
+### Teardown order
+
+1. **Kill tmux sessions first** so agents stop before git state is touched.
+2. **Uncommitted changes check** — for each worktree with dirty state, prompts:
+   - **Commit all changes** — asks for a message, runs `git add -A && git commit`. Empty message keeps the worktree intact.
+   - **Discard changes** — `git reset --hard HEAD && git clean -fd`.
+   - **Keep worktree — skip cleanup** — leaves worktree + branch untouched.
+3. **Per-branch action picker** — for every agent branch with commits not in HEAD:
+   - **Merge into a branch** — pick any branch in the repo via `gum filter`; merges with `--no-ff`.
+   - **Keep branch (remove worktree only)** — branch survives, worktree gone.
+   - **Delete without merging** — default action when no commits ahead.
+   - Branches with no new commits are skipped silently.
+4. **Execute merges** — checks out target, runs `git merge --no-ff <branch>`, then restores original HEAD.
+   - **CLAUDE.md conflicts auto-resolve** to the target version (since each worktree carries its own agent template).
+   - **Any other conflict aborts the merge** (`git merge --abort`) and keeps the branch so you can resolve manually.
+5. **Remove worktrees** → **delete branches** (kept ones skipped) → **remove bridge dirs** → **remove `.claude-dev` config files**.
+
 ## Scripted (no wizard)
 
 ```bash
@@ -139,7 +156,7 @@ claude-dev \
 | `--role-b` | `secondary` | Label shown in agent headers and `CLAUDE.md` |
 | `--session` | `claude-dev` | Base name for tmux sessions and worktree branches |
 | `--base-dir` | `~/sites` | Where to clone repos and where the local picker looks |
-| `--preset` | — | `sanity-nextjs` or `payload-nextjs` — two worktrees from one repo with role-specific templates |
+| `--preset` | — | `sanity-nextjs`, `payload-nextjs`, or `statamic` — two worktrees from one repo with role-specific templates |
 | `--pick-terminal` | — | Force the terminal picker even if `~/.claude-dev-global` already has one saved |
 | `--end` | — | Interactively tear down the session for the current repo |
 | `-h, --help` | — | Show usage and examples |
@@ -195,7 +212,9 @@ So if your repo is at `~/sites/frontend`, the worktree lands at `~/sites/claude-
 
 ### Merging work back
 
-Each agent's branch is a normal git branch. Use your usual merge workflow:
+`claude-dev --end` includes an interactive merge picker per branch — pick a target via `gum filter`, it runs `git merge --no-ff` and auto-resolves the `CLAUDE.md` conflict to the target version. Any other conflict aborts the merge and keeps the branch.
+
+For a manual merge outside `--end`:
 
 ```bash
 git -C ~/sites/frontend checkout main
@@ -366,6 +385,85 @@ pnpm dev
 
 ---
 
+## Statamic single-repo
+
+For Statamic 6 + Laravel projects (single Laravel app, Control Panel + frontend in one codebase), use the `statamic` preset:
+
+```bash
+claude-dev --repo-a ./my-app --preset statamic
+
+# With features:
+claude-dev --repo-a ./my-app --preset statamic --features "homepage,blog"
+```
+
+If you run `claude-dev` interactively and the selected repo's `composer.json` declares `statamic/cms`, the preset is offered automatically.
+
+This preset assumes **Blade templates only** — Antlers is not used. Templates and bridge contract are written for Blade exclusively.
+
+### What the preset does
+
+- Creates **two worktrees from the same repo**: one for the Statamic agent (`-statamic` branch), one for the frontend agent (`-frontend` branch)
+- Installs role-specific `CLAUDE.md` templates (`CLAUDE-agent-statamic.md` / `CLAUDE-agent-frontend-statamic.md`)
+- Defaults roles to `statamic` and `frontend`
+- Adds coordination files to the bridge (see below)
+
+### Agent ownership
+
+| Agent | Owns | Reads but doesn't edit |
+|---|---|---|
+| **Statamic** | `resources/blueprints/`, `resources/fieldsets/`, `resources/forms/`, `content/collections/*.yaml`, `content/globals/`, `content/taxonomies/`, `config/statamic/`, `app/Tags/`, `app/Modifiers/`, `app/Scopes/`, `app/Fieldtypes/`, `app/Providers/`, `routes/web.php` | `resources/views/`, `resources/css/`, `resources/scss/`, `resources/js/` |
+| **Frontend** | `resources/views/**/*.blade.php`, `resources/views/components/`, `resources/views/partials/`, `resources/views/layouts/`, `resources/css/`, `resources/scss/`, `resources/js/`, `vite.config.js` | `resources/blueprints/`, `resources/fieldsets/`, `content/collections/*.yaml` |
+
+Neither agent commits entry edits (`content/collections/<x>/*.md`) unless explicitly asked — those are runtime content.
+
+### Extra bridge files (preset only)
+
+```
+blueprint-status         idle | working | done — frontend agent waits for "done" before coding against new fields
+stache-status            clean | dirty — set to "clean" after Statamic agent runs `php please stache:clear`
+blueprint-contract.md    Statamic agent documents handle names, field types, expected Blade accessors, and partial paths
+module-registry-queue.md append-only queue of new Bard module sets pending Blade template creation
+preset                   "statamic" — used internally by the bridge
+```
+
+### Bard module set workflow
+
+When a new module set is needed (e.g. `hero`), the work spans both agents:
+
+**Statamic agent:**
+1. Add the set to `resources/fieldsets/modules.yaml` (under `sets.module_sets.sets`)
+2. Import any new shared fieldsets
+3. Run `php please stache:clear` → write `clean` / `done` to bridge statuses
+4. Document field shape in `blueprint-contract.md`
+5. Append `hero|hero.blade.php` to `module-registry-queue.md`
+6. Notify frontend agent via bridge
+
+**Frontend agent (on notification):**
+1. Wait for `blueprint-status = done` and `stache-status = clean`
+2. Read `blueprint-contract.md` for the field shape and accessors
+3. Create `resources/views/components/modules/hero.blade.php`
+4. No switch registration — `partials/modules.blade.php` auto-discovers any `components/modules/<handle>.blade.php` via `view()->exists`
+5. Confirm back via bridge
+
+### Dev server
+
+Statamic CP and frontend run from the same Laravel app — no separate process:
+
+```bash
+php artisan serve
+# Frontend:        http://localhost:3000/
+# Control Panel:   http://localhost:3000/cp
+```
+
+### Branch naming
+
+```
+{session}-{feature}-statamic    e.g. claude-dev-main-statamic
+{session}-{feature}-frontend    e.g. claude-dev-main-frontend
+```
+
+---
+
 ## Session layout
 
 For `--features "auth,payments"` with two repos, the launcher opens **two** terminal windows — one per feature, each split into two panes:
@@ -479,6 +577,8 @@ agent2agent-dev/
   CLAUDE-agent-nextjs.md          Next.js agent template (--preset sanity-nextjs)
   CLAUDE-agent-payload.md         Payload agent template (--preset payload-nextjs)
   CLAUDE-agent-nextjs-payload.md  Next.js agent template (--preset payload-nextjs)
+  CLAUDE-agent-statamic.md           Statamic agent template (--preset statamic)
+  CLAUDE-agent-frontend-statamic.md  Frontend agent template (--preset statamic)
   README.md                       This file
 ```
 
@@ -486,10 +586,11 @@ agent2agent-dev/
 
 ## Customising agent templates
 
-`CLAUDE-agent-a.md`, `CLAUDE-agent-b.md`, `CLAUDE-agent-sanity.md`, `CLAUDE-agent-nextjs.md`, `CLAUDE-agent-payload.md`, and `CLAUDE-agent-nextjs-payload.md` are plain markdown files. Edit them to bake in team conventions, coding standards, or response formats. Every session inherits whatever is in these files.
+`CLAUDE-agent-a.md`, `CLAUDE-agent-b.md`, `CLAUDE-agent-sanity.md`, `CLAUDE-agent-nextjs.md`, `CLAUDE-agent-payload.md`, `CLAUDE-agent-nextjs-payload.md`, `CLAUDE-agent-statamic.md`, and `CLAUDE-agent-frontend-statamic.md` are plain markdown files. Edit them to bake in team conventions, coding standards, or response formats. Every session inherits whatever is in these files.
 
 The `--preset sanity-nextjs` flag uses the `sanity`/`nextjs` templates instead of the generic `a`/`b` ones.
 The `--preset payload-nextjs` flag uses the `payload`/`nextjs-payload` templates instead of the generic `a`/`b` ones.
+The `--preset statamic` flag uses the `statamic`/`frontend-statamic` templates instead of the generic `a`/`b` ones.
 
 Available placeholders:
 

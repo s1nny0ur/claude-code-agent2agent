@@ -18,7 +18,7 @@ if [[ -z "$TARGET" || -z "$MESSAGE" ]]; then
   exit 1
 fi
 
-TARGET="${TARGET,,}"
+TARGET=$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')
 if [[ "$TARGET" != "a" && "$TARGET" != "b" ]]; then
   echo "Error: target must be 'a' or 'b'" >&2
   exit 1
