@@ -144,6 +144,30 @@ When adding a new collection (e.g. `events`):
 
 ---
 
+## Worktree cross-links
+
+At launch, `launch.sh` created symlinks inside your worktree so the running
+PHP application can see both agents' work without merging branches:
+
+| Path in `{{DIR_A}}` | Points to |
+|---|---|
+| `resources/views/` | `{{DIR_B}}/resources/views/` |
+| `resources/css/` | `{{DIR_B}}/resources/css/` |
+| `resources/scss/` | `{{DIR_B}}/resources/scss/` |
+| `resources/js/` | `{{DIR_B}}/resources/js/` |
+
+`storage/` is NOT shared — each worktree keeps its own. The Statamic agent owns
+`php please stache:clear` and always runs it from `{{DIR_A}}`.
+
+These paths are symlinks — do **not** commit them. `git update-index --skip-worktree`
+is already set on the replaced files. Any untracked files appearing inside
+those dirs come from the frontend agent; leave them alone.
+
+**The PHP server must run from `{{DIR_A}}`** — that is the only worktree where
+both blueprint changes (yours) and view changes (frontend agent's) are visible.
+
+---
+
 ## Control Panel
 
 Statamic CP runs at:

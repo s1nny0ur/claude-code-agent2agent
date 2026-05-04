@@ -364,6 +364,28 @@ exclude_claude_md_from_git() {
   fi
 }
 
+# Strip any 120000-mode (symlink) entries from the latest commit in $1.
+# Cross-link symlinks created in worktrees can get committed by agents and
+# then merge into main via --preview or --end; this catches them post-merge.
+strip_symlinks_from_merge() {
+  local _root="$1"
+  local _syms
+  _syms=$(git -C "$_root" ls-files --stage 2>/dev/null \
+    | grep '^120000' | cut -f2)
+  [[ -z "$_syms" ]] && return 0
+  gum style --foreground 220 "  Stripping symlinks from merge…" >&2
+  while IFS= read -r _sp; do
+    if git -C "$_root" cat-file -e "HEAD~1:$_sp" 2>/dev/null; then
+      git -C "$_root" checkout HEAD~1 -- "$_sp" >/dev/null 2>&1 || true
+    else
+      git -C "$_root" rm --cached "$_sp" >/dev/null 2>&1 || true
+    fi
+    gum style --faint "    ↳ restored $_sp" >&2
+  done <<< "$_syms"
+  git -C "$_root" commit --amend --no-edit >/dev/null 2>&1 \
+    && gum style --foreground 40 "  ✓ Amended merge commit to strip symlinks" >&2
+}
+
 # ── Config helpers ────────────────────────────────────────────────────────────
 load_config() {
   local cfg="$1" val
@@ -596,6 +618,7 @@ if [[ "$END_SESSION" == true ]]; then
     fi
 
     if git -C "$_mg_repo" merge --no-ff "$_mg_src" 2>/dev/null; then
+      strip_symlinks_from_merge "$_mg_repo"
       gum style --foreground 40 "✓ Merged $_mg_src → $_mg_tgt" >&2
     else
       _mg_conflicts=$(git -C "$_mg_repo" diff --name-only --diff-filter=U 2>/dev/null)
@@ -603,6 +626,7 @@ if [[ "$END_SESSION" == true ]]; then
         git -C "$_mg_repo" checkout HEAD -- CLAUDE.md >/dev/null 2>&1
         git -C "$_mg_repo" add CLAUDE.md >/dev/null 2>&1
         if git -C "$_mg_repo" -c core.editor=true commit --no-edit >/dev/null 2>&1; then
+          strip_symlinks_from_merge "$_mg_repo"
           gum style --foreground 40 \
             "✓ Merged $_mg_src → $_mg_tgt  (auto-resolved CLAUDE.md to target)" >&2
         else
@@ -741,8 +765,21 @@ if [[ "$PREVIEW_SESSION" == true ]]; then
         gum style --faint "  $_branch — no new commits" >&2
         continue
       fi
+
+      # Warn if branch has committed symlinks (cross-link artifacts from worktrees)
+      _branch_syms=$(git -C "$_prev_root" ls-tree -r "$_branch" 2>/dev/null \
+        | grep '^120000' | cut -f2)
+      if [[ -n "$_branch_syms" ]]; then
+        gum style --foreground 220 \
+          "⚠  $_branch has committed symlinks (cross-link artifacts) — will strip after merge:" >&2
+        while IFS= read -r _sp; do
+          gum style --faint "    $_sp" >&2
+        done <<< "$_branch_syms"
+      fi
+
       if git -C "$_prev_root" merge --no-ff "$_branch" -m "preview: merge $_branch into $_prev_head" \
           >/dev/null 2>&1; then
+        strip_symlinks_from_merge "$_prev_root"
         gum style --foreground 40 "✓ Merged $_branch  ($_ahead commit(s))" >&2
         _merged_any=true
       else
@@ -750,11 +787,14 @@ if [[ "$PREVIEW_SESSION" == true ]]; then
         if [[ "$_conflicts" == "CLAUDE.md" ]]; then
           git -C "$_prev_root" checkout HEAD -- CLAUDE.md >/dev/null 2>&1
           git -C "$_prev_root" add CLAUDE.md >/dev/null 2>&1
-          git -C "$_prev_root" -c core.editor=true commit --no-edit >/dev/null 2>&1 \
-            && gum style --foreground 40 "✓ Merged $_branch (auto-resolved CLAUDE.md)" >&2 \
-            && _merged_any=true \
-            || { gum style --foreground 196 "✗ Conflict: $_branch — resolve manually" >&2
-                 git -C "$_prev_root" merge --abort 2>/dev/null || true; }
+          if git -C "$_prev_root" -c core.editor=true commit --no-edit >/dev/null 2>&1; then
+            strip_symlinks_from_merge "$_prev_root"
+            gum style --foreground 40 "✓ Merged $_branch (auto-resolved CLAUDE.md)" >&2
+            _merged_any=true
+          else
+            gum style --foreground 196 "✗ Conflict: $_branch — resolve manually" >&2
+            git -C "$_prev_root" merge --abort 2>/dev/null || true
+          fi
         else
           gum style --foreground 196 "✗ Conflict: $_branch — resolve manually" >&2
           git -C "$_prev_root" merge --abort 2>/dev/null || true
@@ -934,6 +974,77 @@ gum style \
   --padding "0 2" --margin "1 0" \
   "$_summary" >&2
 
+# ── Statamic cross-link ───────────────────────────────────────────────────────
+# For the statamic preset, both agents share one repo but work in separate
+# worktrees. The running PHP app must see BOTH agents' files simultaneously:
+# blueprints (Statamic agent, WT_A) and views (frontend agent, WT_B).
+#
+# Fix: symlink each agent's owned dirs into the other's worktree so the live
+# server (run from WT_A) always sees current views, and WT_B always sees
+# current blueprints. Use --skip-worktree on pre-existing tracked files so
+# git ignores the differences; per-worktree info/exclude hides new untracked
+# files that appear via the symlink.
+cross_link_statamic() {
+  local wt_a="$1" wt_b="$2"
+
+  _do_cross_link() {
+    local src="$1" dst_rel="$2" dst_wt="$3"
+    [[ -e "$src" ]] || return 0
+
+    # Don't symlink into the main (non-linked) worktree — symlinks there survive
+    # into preview merges and pollute the main repo.
+    local _gd _gc
+    _gd=$(git -C "$dst_wt" rev-parse --git-dir 2>/dev/null) || return 0
+    _gc=$(git -C "$dst_wt" rev-parse --git-common-dir 2>/dev/null) || return 0
+    [[ "$_gd" != /* ]] && _gd="$dst_wt/$_gd"
+    [[ "$_gc" != /* ]] && _gc="$dst_wt/$_gc"
+    if [[ "$_gd" == "$_gc" ]]; then
+      gum style --foreground 220 \
+        "⚠  Skipping cross-link in main worktree: $dst_wt/$dst_rel" >&2
+      return 0
+    fi
+
+    # Capture tracked files before deletion so we can skip-worktree them
+    local _tracked
+    _tracked=$(git -C "$dst_wt" ls-files -- "$dst_rel" 2>/dev/null)
+
+    rm -rf "$dst_wt/$dst_rel"
+    mkdir -p "$(dirname "$dst_wt/$dst_rel")"
+    ln -sfn "$src" "$dst_wt/$dst_rel"
+
+    # skip-worktree on existing tracked files — prevents git noticing the change
+    if [[ -n "$_tracked" ]]; then
+      while IFS= read -r _f; do
+        [[ -n "$_f" ]] && git -C "$dst_wt" update-index --skip-worktree "$_f" 2>/dev/null || true
+      done <<< "$_tracked"
+    fi
+
+    # Per-worktree info/exclude — hides new untracked files visible via symlink
+    local _gd
+    _gd=$(git -C "$dst_wt" rev-parse --git-dir 2>/dev/null) || return 0
+    mkdir -p "$_gd/info"
+    grep -qxF "$dst_rel" "$_gd/info/exclude" 2>/dev/null \
+      || echo "$dst_rel" >> "$_gd/info/exclude"
+
+    gum style --faint "  ↳ $dst_wt/$dst_rel → $src" >&2
+  }
+
+  gum style --foreground 51 "Cross-linking Statamic/frontend worktrees…" >&2
+
+  # WT_A (Statamic agent) gets frontend-owned dirs from WT_B
+  # so the PHP server started from WT_A sees live view/asset changes
+  _do_cross_link "$wt_b/resources/views" "resources/views" "$wt_a"
+  _do_cross_link "$wt_b/resources/css"   "resources/css"   "$wt_a"
+  _do_cross_link "$wt_b/resources/scss"  "resources/scss"  "$wt_a"
+  _do_cross_link "$wt_b/resources/js"    "resources/js"    "$wt_a"
+
+  # WT_B (frontend agent) gets Statamic-owned dirs from WT_A
+  # so `php please` commands run from WT_B see live blueprint changes
+  _do_cross_link "$wt_a/resources/blueprints" "resources/blueprints" "$wt_b"
+  _do_cross_link "$wt_a/resources/fieldsets"  "resources/fieldsets"  "$wt_b"
+
+}
+
 # ── Create worktrees + open terminal windows per agent per feature ────────────
 CLEANUP_HINTS=()
 
@@ -956,6 +1067,8 @@ for feature in "${FEATURES[@]}"; do
 
   exclude_claude_md_from_git "$WT_A"
   [[ -n "$WT_B" ]] && exclude_claude_md_from_git "$WT_B"
+
+  [[ "$PRESET" == "statamic" && -n "$WT_B" ]] && cross_link_statamic "$WT_A" "$WT_B"
 
   rm -rf "$BRIDGE"
   mkdir -p "$BRIDGE"

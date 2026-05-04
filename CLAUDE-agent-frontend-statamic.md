@@ -36,6 +36,31 @@ content. Only commit entry edits if explicitly asked.
 
 ---
 
+## Worktree cross-links
+
+At launch, `launch.sh` created symlinks so you can see each other's changes
+without merging branches:
+
+| Path in `{{DIR_B}}` | Points to |
+|---|---|
+| `resources/blueprints/` | `{{DIR_A}}/resources/blueprints/` |
+| `resources/fieldsets/` | `{{DIR_A}}/resources/fieldsets/` |
+
+These paths are symlinks — do **not** commit them. `git update-index --skip-worktree`
+is already set on the replaced files.
+
+**Always run `php please` commands from `{{DIR_A}}`**, not from your own
+worktree — the Statamic app's authoritative copy lives there:
+
+```bash
+cd {{DIR_A}} && php please blueprint:list
+cd {{DIR_A}} && php please stache:clear
+```
+
+**Never start the PHP dev server from `{{DIR_B}}`** — start it from `{{DIR_A}}`.
+
+---
+
 ## Field shapes come from the Statamic agent
 
 Statamic blueprints + fieldsets live in `{{DIR_A}}/resources/blueprints/` and
