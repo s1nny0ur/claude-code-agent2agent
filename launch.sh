@@ -41,6 +41,7 @@ show_help() {
   printf '  --preset NAME               Preset: sanity-nextjs | payload-nextjs | statamic (co-located repo)\n'
   printf '  --pick-terminal             Re-run the terminal picker\n'
   printf '  --end                       Kill tmux session, remove worktrees & branches\n'
+  printf '  --preview                   Merge agent branches into main for browser preview\n'
   printf '  -h, --help                  Show this help\n'
   printf '\n'
   printf 'EXAMPLES\n'
@@ -69,6 +70,7 @@ GLOBAL_CONFIG="$HOME/.claude-dev-global"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FORCE_PICK_TERMINAL=false
 END_SESSION=false
+PREVIEW_SESSION=false
 PRESET=""
 RESUMING=false
 
@@ -85,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --preset)        PRESET="$2";             shift 2 ;;
     --pick-terminal) FORCE_PICK_TERMINAL=true; shift ;;
     --end)           END_SESSION=true; shift ;;
+    --preview)       PREVIEW_SESSION=true; shift ;;
     -h|--help)
       show_help
       exit 0
@@ -286,6 +289,13 @@ create_worktree() {
   gum style --foreground 40 \
     "✓ Worktree: $wt_dir  ($branch ← $parent_branch)" >&2
 
+  # Symlink vendor/ so PHP pre-commit hooks (pint, phpstan, etc.) work inside worktrees.
+  # vendor/ is gitignored and only exists in the main repo after `composer install`.
+  if [[ -d "$repo_root/vendor" && ! -e "$wt_dir/vendor" ]]; then
+    ln -sfn "$repo_root/vendor" "$wt_dir/vendor" >&2 || true
+    gum style --faint "  ↳ vendor/ symlinked from $repo_root" >&2
+  fi
+
   echo "$wt_dir"
 }
 
@@ -396,7 +406,7 @@ if [[ "$END_SESSION" == true ]]; then
   [[ -n "$_repo_b" ]] && _root_b=$(git -C "$_repo_b" rev-parse --show-toplevel 2>/dev/null || echo "$_repo_b")
 
   _summary_lines=""
-  declare -a _sessions=() _worktrees=() _branches=() _bridges=() _configs=()
+  declare -a _sessions=() _worktrees=() _branches=() _bridges=()
 
   for _f in "${_end_features[@]}"; do
     _sess="${SESSION_NAME}-${_f}-a"
@@ -432,9 +442,6 @@ if [[ "$END_SESSION" == true ]]; then
       _summary_lines+=$'\n'"    worktree:      $(dirname "$_root_b")/$_branch_b  (branch $_branch_b)"
     [[ -d "$_bridge" ]] && _summary_lines+=$'\n'"    bridge:        $_bridge"
   done
-
-  _configs+=("$_root_a/$CONFIG_FILE")
-  [[ -n "$_root_b" ]] && _configs+=("$_root_b/$CONFIG_FILE")
 
   gum style \
     --border rounded --border-foreground 196 \
@@ -651,13 +658,6 @@ if [[ "$END_SESSION" == true ]]; then
     fi
   done
 
-  for _cfg in "${_configs[@]}"; do
-    if [[ -f "$_cfg" ]]; then
-      rm -f "$_cfg"
-      gum style --foreground 40 "✓ Removed $_cfg" >&2
-    fi
-  done
-
   gum style \
     --border rounded --border-foreground 40 \
     --bold --padding "0 2" --margin "1 0" \
@@ -665,29 +665,140 @@ if [[ "$END_SESSION" == true ]]; then
   exit 0
 fi
 
+# ── Preview mode — merge agent branches into main for browser testing ─────────
+if [[ "$PREVIEW_SESSION" == true ]]; then
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: No .claude-dev found in current directory." >&2
+    echo "Run claude-dev --preview from inside a repo launched with claude-dev." >&2
+    exit 1
+  fi
+  load_config "$CONFIG_FILE"
+
+  _prev_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Error: Not in a git repository." >&2; exit 1
+  }
+  _prev_head=$(git -C "$_prev_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  IFS=',' read -ra _prev_features <<< "$RAW_FEATURES"
+  for i in "${!_prev_features[@]}"; do _prev_features[$i]="${_prev_features[$i]// /}"; done
+
+  _merged_any=false
+
+  for _f in "${_prev_features[@]}"; do
+    if [[ "$PRESET" == "statamic" ]]; then
+      _prev_branches=("${SESSION_NAME}-${_f}-statamic" "${SESSION_NAME}-${_f}-frontend")
+    elif [[ "$PRESET" == "sanity-nextjs" ]]; then
+      _prev_branches=("${SESSION_NAME}-${_f}-sanity" "${SESSION_NAME}-${_f}-nextjs")
+    elif [[ "$PRESET" == "payload-nextjs" ]]; then
+      _prev_branches=("${SESSION_NAME}-${_f}-payload" "${SESSION_NAME}-${_f}-nextjs")
+    else
+      _prev_branches=("${SESSION_NAME}-${_f}-a" "${SESSION_NAME}-${_f}-b")
+    fi
+
+    for _branch in "${_prev_branches[@]}"; do
+      if ! git -C "$_prev_root" rev-parse --verify "$_branch" &>/dev/null; then
+        gum style --faint "  $_branch — branch not found, skipping" >&2
+        continue
+      fi
+
+      # ── Commit any dirty worktree before merge ──────────────────────────────
+      _prev_wt="$(dirname "$_prev_root")/$_branch"
+      if [[ -d "$_prev_wt" ]]; then
+        _prev_dirty=$(git -C "$_prev_wt" status --porcelain 2>/dev/null)
+        if [[ -n "$_prev_dirty" ]]; then
+          gum style \
+            --border rounded --border-foreground 220 \
+            --padding "0 1" --margin "1 0" \
+            "Uncommitted changes in $_branch (preview will miss these):" \
+            "" \
+            "$_prev_dirty" >&2
+          _prev_commit_action=$(gum choose \
+            "Commit all changes" \
+            "Skip this branch" \
+            --header "Commit before preview merge?")
+          case "$_prev_commit_action" in
+            "Commit all changes")
+              _prev_commit_msg=$(gum input --placeholder "feat: ..." --prompt "Commit message ❯ ")
+              if [[ -n "$_prev_commit_msg" ]]; then
+                git -C "$_prev_wt" add -A >/dev/null
+                git -C "$_prev_wt" commit -m "$_prev_commit_msg" >/dev/null
+                gum style --foreground 40 "✓ Committed to $_branch" >&2
+              else
+                gum style --faint "  Empty message — skipping $_branch" >&2
+                continue
+              fi
+              ;;
+            "Skip this branch")
+              gum style --faint "  Skipping $_branch" >&2
+              continue
+              ;;
+          esac
+        fi
+      fi
+
+      _ahead=$(git -C "$_prev_root" log --oneline "$_branch" --not HEAD 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$_ahead" -eq 0 ]]; then
+        gum style --faint "  $_branch — no new commits" >&2
+        continue
+      fi
+      if git -C "$_prev_root" merge --no-ff "$_branch" -m "preview: merge $_branch into $_prev_head" \
+          >/dev/null 2>&1; then
+        gum style --foreground 40 "✓ Merged $_branch  ($_ahead commit(s))" >&2
+        _merged_any=true
+      else
+        _conflicts=$(git -C "$_prev_root" diff --name-only --diff-filter=U 2>/dev/null)
+        if [[ "$_conflicts" == "CLAUDE.md" ]]; then
+          git -C "$_prev_root" checkout HEAD -- CLAUDE.md >/dev/null 2>&1
+          git -C "$_prev_root" add CLAUDE.md >/dev/null 2>&1
+          git -C "$_prev_root" -c core.editor=true commit --no-edit >/dev/null 2>&1 \
+            && gum style --foreground 40 "✓ Merged $_branch (auto-resolved CLAUDE.md)" >&2 \
+            && _merged_any=true \
+            || { gum style --foreground 196 "✗ Conflict: $_branch — resolve manually" >&2
+                 git -C "$_prev_root" merge --abort 2>/dev/null || true; }
+        else
+          gum style --foreground 196 "✗ Conflict: $_branch — resolve manually" >&2
+          git -C "$_prev_root" merge --abort 2>/dev/null || true
+        fi
+      fi
+    done
+  done
+
+  if [[ "$_merged_any" == true && "$PRESET" == "statamic" && -f "$_prev_root/artisan" ]]; then
+    gum spin --title "Clearing Statamic stache…" -- \
+      bash -c "cd '$_prev_root' && php please stache:clear" >&2 \
+      && gum style --foreground 40 "✓ Stache cleared" >&2 \
+      || gum style --foreground 220 "⚠  stache:clear failed — run manually" >&2
+  fi
+
+  _prev_msg="Preview merged into $_prev_head."$'\n'"Refresh your browser to see agent changes."
+  [[ "$_merged_any" == false ]] && _prev_msg="Nothing to merge — agent branches have no new commits."
+  gum style \
+    --border rounded --border-foreground 40 \
+    --bold --padding "0 2" --margin "1 0" \
+    "$_prev_msg" >&2
+  exit 0
+fi
+
 # ── Config auto-detection ─────────────────────────────────────────────────────
 if [[ -z "$REPO_A" && -f "$CONFIG_FILE" ]]; then
-  _cfg_a=$(grep '^REPO_A='   "$CONFIG_FILE" | cut -d= -f2-)
-  _cfg_b=$(grep '^REPO_B='   "$CONFIG_FILE" | cut -d= -f2-)
-  _cfg_f=$(grep '^FEATURES=' "$CONFIG_FILE" | cut -d= -f2-)
-  _cfg_s=$(grep '^SESSION='  "$CONFIG_FILE" | cut -d= -f2-)
+  load_config "$CONFIG_FILE"
+  RAW_FEATURES=""  # always prompt for branch/feature name on resume
+  RESUMING=true
 
+  _cfg_a="$REPO_A"
+  _cfg_b="${REPO_B:-}"
+  _cfg_s="$SESSION_NAME"
   _info="Repo A:    $_cfg_a"
   [[ -n "$_cfg_b" ]] && _info+=$'\n'"Repo B:    $_cfg_b"
-  _info+=$'\n'"Features:  $_cfg_f"
+  [[ -n "$PRESET" ]]  && _info+=$'\n'"Preset:    $PRESET"
   _info+=$'\n'"Session:   $_cfg_s"
 
   gum style \
     --border rounded --border-foreground 220 \
     --bold --padding "0 2" --margin "1 0" \
-    "Claude Dev — Saved Session" \
+    "Claude Dev — Existing Project" \
     "" \
     "$_info" >&2
-
-  if gum confirm --default=true "Resume saved session?"; then
-    load_config "$CONFIG_FILE"
-    RESUMING=true
-  fi
 fi
 
 # ── Terminal picker ───────────────────────────────────────────────────────────
@@ -914,12 +1025,10 @@ for feature in "${FEATURES[@]}"; do
     _tmpl_a="CLAUDE-agent-a.md"
     _tmpl_b="CLAUDE-agent-b.md"
   fi
-  if [[ "$RESUMING" == false ]]; then
-    install_claude_md "$_tmpl_a" "$WT_A/CLAUDE.md" "$BRIDGE" "$feature" \
-      "$WT_A" "${WT_B:-}"
-    [[ -n "$WT_B" ]] && install_claude_md "$_tmpl_b" "$WT_B/CLAUDE.md" "$BRIDGE" "$feature" \
-      "$WT_A" "$WT_B"
-  fi
+  install_claude_md "$_tmpl_a" "$WT_A/CLAUDE.md" "$BRIDGE" "$feature" \
+    "$WT_A" "${WT_B:-}"
+  [[ -n "$WT_B" ]] && install_claude_md "$_tmpl_b" "$WT_B/CLAUDE.md" "$BRIDGE" "$feature" \
+    "$WT_A" "$WT_B"
 
   if [[ -n "$WT_B" ]]; then
     open_in_terminal "$WT_A" "$SESSION_A" "$ROLE_A agent [$feature]" \

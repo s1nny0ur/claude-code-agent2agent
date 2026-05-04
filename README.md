@@ -159,6 +159,7 @@ claude-dev \
 | `--preset` | — | `sanity-nextjs`, `payload-nextjs`, or `statamic` — two worktrees from one repo with role-specific templates |
 | `--pick-terminal` | — | Force the terminal picker even if `~/.claude-dev-global` already has one saved |
 | `--end` | — | Interactively tear down the session for the current repo |
+| `--preview` | — | Merge agent branches into main so you can test in the browser |
 | `-h, --help` | — | Show usage and examples |
 
 ---
@@ -210,7 +211,19 @@ So if your repo is at `~/sites/frontend`, the worktree lands at `~/sites/claude-
 | Worktree dir already exists | Reuses it — useful when re-launching after a crash |
 | Branch already exists but dir is gone | Git will error — run `claude-dev --end` or delete the branch manually |
 
-### Merging work back
+### Testing in the browser mid-session
+
+While agents are still working, run from inside the repo:
+
+```bash
+claude-dev --preview
+```
+
+This merges each agent's branch into your current HEAD (`main`), runs `php please stache:clear` for Statamic projects, and the already-running dev server picks up the changes automatically. The worktrees remain intact so agents can keep working.
+
+Run `--preview` as many times as you like — it only merges commits that aren't already in HEAD.
+
+### Merging work back at session end
 
 `claude-dev --end` includes an interactive merge picker per branch — pick a target via `gum filter`, it runs `git merge --no-ff` and auto-resolves the `CLAUDE.md` conflict to the target version. Any other conflict aborts the merge and keeps the branch.
 
