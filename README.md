@@ -131,6 +131,7 @@ Shows a summary of everything that will be removed — tmux session, worktrees, 
    - Branches with no new commits are skipped silently.
 4. **Execute merges** — checks out target, runs `git merge --no-ff <branch>`, then restores original HEAD.
    - **CLAUDE.md conflicts auto-resolve** to the target version (since each worktree carries its own agent template).
+   - **Committed symlinks auto-strip** — any `120000`-mode (symlink) entries merged in from agent branches (e.g. Statamic cross-link artifacts) are restored to their pre-merge state and the merge commit is amended.
    - **Any other conflict aborts the merge** (`git merge --abort`) and keeps the branch so you can resolve manually.
 5. **Remove worktrees** → **delete branches** (kept ones skipped) → **remove bridge dirs** → **remove `.claude-dev` config files**.
 
@@ -221,7 +222,7 @@ claude-dev --preview
 
 This merges each agent's branch into your current HEAD (`main`), runs `php please stache:clear` for Statamic projects, and the already-running dev server picks up the changes automatically. The worktrees remain intact so agents can keep working.
 
-Run `--preview` as many times as you like — it only merges commits that aren't already in HEAD.
+Run `--preview` as many times as you like — it only merges commits that aren't already in HEAD. Any symlinks committed into agent branches (e.g. Statamic cross-link artifacts) are automatically stripped from the preview merge commit so they don't land in your main worktree.
 
 ### Merging work back at session end
 
@@ -457,6 +458,30 @@ When a new module set is needed (e.g. `hero`), the work spans both agents:
 3. Create `resources/views/components/modules/hero.blade.php`
 4. No switch registration — `partials/modules.blade.php` auto-discovers any `components/modules/<handle>.blade.php` via `view()->exists`
 5. Confirm back via bridge
+
+### Worktree cross-links
+
+Both agents share one repo but work in separate worktrees. At launch, `launch.sh` symlinks each agent's owned directories into the other's worktree so the running PHP app can see both agents' changes without a merge:
+
+| Path in Statamic worktree (`-statamic`) | Points to |
+|---|---|
+| `resources/views/` | frontend worktree's `resources/views/` |
+| `resources/css/` | frontend worktree's `resources/css/` |
+| `resources/scss/` | frontend worktree's `resources/scss/` |
+| `resources/js/` | frontend worktree's `resources/js/` |
+
+| Path in frontend worktree (`-frontend`) | Points to |
+|---|---|
+| `resources/blueprints/` | Statamic worktree's `resources/blueprints/` |
+| `resources/fieldsets/` | Statamic worktree's `resources/fieldsets/` |
+
+`git update-index --skip-worktree` is set on all replaced tracked files so `git status` stays clean. **Agents must not commit these paths** — they're cross-links, not owned files.
+
+The PHP server must run from the **Statamic worktree** (`-statamic`) — it's the only worktree where both blueprint changes and view changes are simultaneously visible.
+
+Cross-links are only created in true linked worktrees. If worktree creation falls back to the main repo (detached HEAD, branch conflict), symlinking is skipped entirely to avoid polluting the main repo.
+
+Any symlinks that do get committed into an agent branch (e.g. via an explicit `git add`) are automatically stripped from the merge commit when you run `--preview` or `--end`.
 
 ### Dev server
 
