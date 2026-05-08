@@ -50,6 +50,36 @@ fi
 
 echo "✓ gum $(gum --version 2>/dev/null | head -1)"
 
+# ── Ensure tmux is available ──────────────────────────────────────────────────
+if ! command -v tmux &>/dev/null; then
+  echo ""
+  echo "tmux is required for the launcher (https://github.com/tmux/tmux)"
+  echo ""
+  if command -v brew &>/dev/null; then
+    read -rp "Install via Homebrew? [Y/n] " _yn
+    if [[ "${_yn:-Y}" =~ ^[Yy] ]]; then
+      brew install tmux
+    else
+      echo "Skipping tmux install. The launcher will not work without it." >&2
+      exit 1
+    fi
+  elif command -v apt-get &>/dev/null; then
+    read -rp "Install via apt? [Y/n] " _yn
+    if [[ "${_yn:-Y}" =~ ^[Yy] ]]; then
+      sudo apt update && sudo apt install -y tmux
+    else
+      echo "Skipping tmux install. The launcher will not work without it." >&2
+      exit 1
+    fi
+  else
+    echo "Could not detect a supported package manager (brew/apt)." >&2
+    echo "Install tmux manually: https://github.com/tmux/tmux/wiki/Installing" >&2
+    exit 1
+  fi
+fi
+
+echo "✓ tmux $(tmux -V)"
+
 # ── Add claude-dev shell function ─────────────────────────────────────────────
 if [[ -f "$HOME/.zshrc" ]]; then
   PROFILE="$HOME/.zshrc"

@@ -78,7 +78,8 @@ source ~/.zshrc
 
 `install.sh` will:
 1. Install `gum` via Homebrew (or apt on Linux) if not already present — prompts before installing
-2. Add a `claude-dev` shell function to your `~/.zshrc` so the launcher is available from anywhere
+2. Install `tmux` via Homebrew (or apt on Linux) if not already present — prompts before installing
+3. Add a `claude-dev` shell function to your `~/.zshrc` so the launcher is available from anywhere
 
 ## First launch
 
@@ -568,6 +569,8 @@ The script writes the message to a file and injects a prompt into the receiving 
 ## CLAUDE.md installation
 
 At launch, `CLAUDE.md` is installed into each **worktree** (not the original repo) from the templates `CLAUDE-agent-a.md` / `CLAUDE-agent-b.md`. Placeholders are replaced with real paths, roles, and bridge location.
+
+**This file is worktree-only.** It is added to `.git/info/exclude` so git never stages or commits it. When you merge a worktree branch back into your feature branch (via `--end` or `--preview`), `CLAUDE.md` is auto-resolved to the target branch's version — it will never appear in your feature branch's history or pollute a PR.
 
 If a `CLAUDE.md` already exists you're prompted to skip, overwrite, or append. **Append** is recommended for existing projects — it preserves your project instructions and adds the bridge config below a `---` separator.
 

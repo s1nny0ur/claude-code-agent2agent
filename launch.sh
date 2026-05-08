@@ -324,7 +324,7 @@ install_claude_md() {
       "Skip — leave it untouched" \
       "Overwrite — replace entirely" \
       "Append — add agent config to end" \
-      --header "CLAUDE.md already exists: $(basename "$dest") in ${dest%/*}")
+      --header "CLAUDE.md already exists in worktree ${dest%/*} — worktree-only, excluded from git, will NOT merge into your feature branch")
     case "$choice" in
       "Overwrite — replace entirely")
         cp "$tmp" "$dest"
@@ -341,7 +341,7 @@ install_claude_md() {
     esac
   else
     cp "$tmp" "$dest"
-    gum style --foreground 40 "✓ Installed $dest" >&2
+    gum style --foreground 40 "✓ Installed $dest (worktree-only — excluded from git, will not merge into your feature branch)" >&2
   fi
 
   rm -f "$tmp"
@@ -496,6 +496,7 @@ if [[ "$END_SESSION" == true ]]; then
   }
 
   # ── Kill tmux sessions first so agents stop before we touch git ───────────────
+  gum style --bold --foreground 33 $'\n''[1/5] Stopping agents…' >&2
   for _sess in "${_sessions[@]}"; do
     if tmux kill-session -t "$_sess" 2>/dev/null; then
       gum style --foreground 40 "✓ Killed tmux session $_sess" >&2
@@ -505,6 +506,7 @@ if [[ "$END_SESSION" == true ]]; then
   done
 
   # ── Uncommitted changes check ─────────────────────────────────────────────────
+  gum style --bold --foreground 33 $'\n''[2/5] Checking for uncommitted changes…' >&2
   for _entry in "${_worktrees[@]}"; do
     IFS='|' read -r _uc_repo _uc_wt <<< "$_entry"
     [[ ! -d "$_uc_wt" ]] && continue
@@ -554,6 +556,7 @@ if [[ "$END_SESSION" == true ]]; then
   done
 
   # ── Merge picker ─────────────────────────────────────────────────────────────
+  gum style --bold --foreground 33 $'\n''[3/5] Reviewing branches…' >&2
   for _entry in "${_branches[@]}"; do
     IFS='|' read -r _mp_repo _mp_branch <<< "$_entry"
     _mp_repo_name=$(basename "$_mp_repo")
@@ -608,6 +611,9 @@ if [[ "$END_SESSION" == true ]]; then
   done
 
   # ── Execute merges ───────────────────────────────────────────────────────────
+  if [[ ${#_merge_ops[@]} -gt 0 ]]; then
+    gum style --bold --foreground 33 $'\n''[4/5] Merging branches…' >&2
+  fi
   for _op in ${_merge_ops[@]+"${_merge_ops[@]}"}; do
     IFS='|' read -r _mg_repo _mg_src _mg_tgt <<< "$_op"
     _mg_saved=$(git -C "$_mg_repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -649,6 +655,7 @@ if [[ "$END_SESSION" == true ]]; then
     fi
   done
 
+  gum style --bold --foreground 33 $'\n''[5/5] Removing worktrees, branches, and bridges…' >&2
   for _entry in "${_worktrees[@]}"; do
     IFS='|' read -r _repo _wt <<< "$_entry"
     if _wt_is_kept "$_entry"; then
